@@ -6,7 +6,10 @@ import signal
 import logging
 import argparse
 import threading  # leave it
+import re
+import subprocess
 
+from enum import Enum
 from typing import Dict, Generator, List, Union
 
 from scapy.layers.dot11 import RadioTap, Dot11Elt, Dot11Beacon, Dot11ProbeResp, Dot11ReassoResp, Dot11AssoResp, \
@@ -23,6 +26,12 @@ except ImportError:
     from utils import *
 
 conf.verb = 0
+
+
+class ScanBand(Enum):
+    ALL = "all"
+    T_24GHZ = "2.4 GHz"
+    T_50GHZ = "5 GHz"
 
 
 #   --------------------------------------------------------------------------------------------------------------------
@@ -45,7 +54,8 @@ class Interceptor:
     _SSID_STR_PAD = 42  # total len 80
 
     def __init__(self, net_iface, skip_monitor_mode_setup, kill_networkmanager,
-                 ssid_name, bssid_addr, custom_client_macs, custom_channels, deauth_all_channels, autostart, debug_mode):
+                 ssid_name, bssid_addr, custom_client_macs, custom_channels, deauth_all_channels, autostart,
+                 debug_mode, scan_only=False, scan_dwell=_CH_SNIFF_TO, scan_passes=1):
         self.interface = net_iface
 
         self._max_consecutive_failed_send_lim = 5 / Interceptor._DEAUTH_INTV  # fails to send for 5 consecutive seconds
@@ -57,6 +67,16 @@ class Interceptor:
 
         self.target_ssid: Union[SSID, None] = None
         self._debug_mode = debug_mode
+        self._scan_only = scan_only
+        self._scan_dwell = scan_dwell
+        self._scan_passes = scan_passes
+        self._scan_stats = {
+            "frames_seen": 0,
+            "ap_frames": 0,
+            "parse_errors": 0,
+            "channel_failures": 0,
+        }
+        self._scan_channel_bssids = defaultdict(set)
 
         if not skip_monitor_mode_setup:
             print_info(f"Setting up monitor mode...")
@@ -83,8 +103,12 @@ class Interceptor:
         self.log_debug(f"Selected target client mac addrs: {self._custom_target_client_mac}")
         self._custom_target_ap_channels: List[int] = self.parse_custom_channels(custom_channels)
         self.log_debug(f"Selected target client channels: {self._custom_target_client_mac}")
+        self._scan_band = self._ask_scan_band()
+        self.log_debug(f"Selected scan band: {self._scan_band.value}")
+        if not self._get_channel_range():
+            print_error(f"No supported channels are available for the selected {self._scan_band.value} band")
+            raise Exception("No channels available for selected scan band")
 
-        self._custom_target_ap_last_ch = 0  # to avoid overlapping
         self._midrun_output_buffer: List[str] = list()
         self._midrun_output_lck = threading.RLock()
 
@@ -183,38 +207,136 @@ class Interceptor:
         return not os.system(cmd)
 
     def _set_channel(self, ch_num):
-        os.system(f"iw dev {self.interface} set channel {ch_num}")
+        try:
+            result = subprocess.run(
+                ["iw", "dev", self.interface, "set", "channel", str(ch_num)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+        except OSError as exc:
+            self.log_debug(f"Unable to run iw for channel {ch_num} -> {exc}")
+            return False
+        if result.returncode != 0:
+            self.log_debug(f"Unable to set channel {ch_num} -> {result.stderr.strip()}")
+            return False
         self._current_channel_num = ch_num
+        return True
 
     def _get_channels(self) -> List[int]:
-        return [int(channel.split('Channel')[1].split(':')[0].strip())
-                for channel in os.popen(f'iwlist {self.interface} channel').readlines()
-                if 'Channel' in channel and 'Current' not in channel]
+        channels = list()
+
+        try:
+            iface_info = subprocess.run(
+                ["iw", "dev", self.interface, "info"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            wiphy_match = re.search(r"^\s*wiphy\s+(\d+)\s*$", iface_info.stdout, re.MULTILINE)
+            if iface_info.returncode == 0 and wiphy_match:
+                phy_channels = subprocess.run(
+                    ["iw", "phy", f"phy{wiphy_match.group(1)}", "info"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                )
+                if phy_channels.returncode == 0:
+                    for line in phy_channels.stdout.splitlines():
+                        match = re.search(r"\*\s+(\d+)\s+MHz\s+\[(\d+)\]", line)
+                        if not match or "disabled" in line.lower():
+                            continue
+                        try:
+                            channel = frequency_to_channel(int(match.group(1)))
+                        except ValueError:
+                            continue
+                        if channel == int(match.group(2)):
+                            channels.append(channel)
+        except (OSError, ValueError) as exc:
+            self.log_debug(f"Unable to obtain channels with iw -> {exc}")
+
+        if not channels:
+            try:
+                iwlist = subprocess.run(
+                    ["iwlist", self.interface, "channel"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                )
+                if iwlist.returncode == 0:
+                    for line in iwlist.stdout.splitlines():
+                        match = re.search(r"Channel\s+(\d+)\s*:\s*([0-9.]+)\s*GHz", line)
+                        if not match or "Current" in line:
+                            continue
+                        try:
+                            channel = frequency_to_channel(round(float(match.group(2)) * 1000))
+                        except ValueError:
+                            continue
+                        if channel == int(match.group(1)):
+                            channels.append(channel)
+            except (OSError, ValueError) as exc:
+                self.log_debug(f"Unable to obtain channels with iwlist -> {exc}")
+
+        channels = sorted(set(channels))
+        if not channels:
+            raise Exception(f"No supported channels were reported for interface {self.interface}")
+        return channels
 
     def _get_channel_range(self) -> List[int]:
-        return self._custom_target_ap_channels or list(self._channel_range.keys())
+        channels = self._custom_target_ap_channels or list(self._channel_range.keys())
+        if self._scan_band == ScanBand.ALL:
+            return channels
+        if self._scan_band == ScanBand.T_24GHZ:
+            return [channel for channel in channels if channel <= 14]
+        return [channel for channel in channels if channel > 14]
+
+    @staticmethod
+    def _ask_scan_band() -> ScanBand:
+        choices = {
+            1: ScanBand.ALL,
+            2: ScanBand.T_24GHZ,
+            3: ScanBand.T_50GHZ,
+        }
+        while True:
+            user_input = print_input("Choose network band: [1] All  [2] 2.4 GHz only  [3] 5 GHz only:")
+            try:
+                chosen = int(user_input)
+            except ValueError:
+                print_error("Wrong input! please enter 1, 2, or 3")
+                continue
+            if chosen in choices:
+                return choices[chosen]
+            print_error("Wrong input! please enter 1, 2, or 3")
 
     def _ap_sniff_cb(self, pkt):
+        self._scan_stats["frames_seen"] += 1
         try:
             if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
-                ap_mac = str(pkt.addr3)
-                ssid = pkt[Dot11Elt].info.strip(b'\x00').decode('utf-8').strip() or ap_mac
+                self._scan_stats["ap_frames"] += 1
+                ap_mac = str(pkt.addr3).lower()
+                ssid = pkt[Dot11Elt].info.strip(b'\x00').decode('utf-8', errors='replace').strip() or ap_mac
                 if ap_mac == BD_MACADDR or not ssid or (self._custom_ssid_name_is_set()
                                                         and self._custom_ssid_name.lower() not in ssid.lower()):
                     return
                 elif self._custom_bssid_addr_is_set() and ap_mac.lower() != self._custom_bssid_addr.lower():
                     return
-                pkt_ch = frequency_to_channel(pkt[RadioTap].Channel)
+                radio_tap = pkt.getlayer(RadioTap)
+                frequency = getattr(radio_tap, 'ChannelFrequency', 0) if radio_tap is not None else 0
+                pkt_ch = frequency_to_channel(frequency) if frequency else self._current_channel_num
                 band_type = BandType.T_50GHZ if pkt_ch > 14 else BandType.T_24GHZ
-                if ssid not in self._all_ssids[band_type]:
-                    self._all_ssids[band_type][ssid] = SSID(ssid, ap_mac, band_type)
-                self._all_ssids[band_type][ssid].add_channel(pkt_ch if pkt_ch in self._channel_range else self._current_channel_num)
-                if self._custom_ssid_name_is_set():
-                    self._custom_target_ap_last_ch = self._all_ssids[band_type][ssid].channel
+                if ap_mac not in self._all_ssids[band_type]:
+                    self._all_ssids[band_type][ap_mac] = SSID(ssid, ap_mac, band_type)
+                elif self._all_ssids[band_type][ap_mac].name == ap_mac and ssid != ap_mac:
+                    self._all_ssids[band_type][ap_mac].name = ssid
+                self._all_ssids[band_type][ap_mac].add_channel(
+                    pkt_ch if pkt_ch in self._channel_range else self._current_channel_num
+                )
+                self._scan_channel_bssids[self._all_ssids[band_type][ap_mac].channel].add(ap_mac)
             else:
                 self._clients_sniff_cb(pkt)  # pass forward to find potential clients
         except Exception as exc:
-            pass
+            self._scan_stats["parse_errors"] += 1
+            self.log_debug(f"Failed to process a packet during AP scan -> {exc}")
 
     def _scan_channels_for_aps(self):
         channels_to_scan = self._get_channel_range()
@@ -222,23 +344,36 @@ class Interceptor:
         if self._custom_ssid_name_is_set():
             print_info(f"Scanning for target SSID -> {BOLD}{self._custom_ssid_name}{RESET}")
         try:
-            for idx, ch_num in enumerate(channels_to_scan):
-                if self._custom_ssid_name_is_set() and self._found_custom_ssid_name() \
-                        and self._current_channel_num - self._custom_target_ap_last_ch > 2:
-                    # make sure sniffing doesn't stop on an overlapped channel for custom SSIDs
-                    return
-                self._set_channel(ch_num)
-                print_info(f"Scanning channel {BOLD}{self._current_channel_num}{RESET}, remaining -> "
-                           f"{len(channels_to_scan) - (idx + 1)} ", end="\r")
-                sniff(prn=self._ap_sniff_cb, iface=self.interface, timeout=Interceptor._CH_SNIFF_TO,
-                      stop_filter=lambda p: Interceptor._ABORT is True)
+            for pass_idx in range(self._scan_passes):
+                if self._scan_passes > 1:
+                    print_info(f"Starting scan pass {pass_idx + 1}/{self._scan_passes}")
+                for idx, ch_num in enumerate(channels_to_scan):
+                    if not self._set_channel(ch_num):
+                        self._scan_stats["channel_failures"] += 1
+                        print_error(f"Skipping channel {ch_num}: interface rejected the channel change")
+                        continue
+                    print_info(f"Scanning channel {BOLD}{self._current_channel_num}{RESET}, remaining -> "
+                               f"{len(channels_to_scan) - (idx + 1)} ", end="\r")
+                    sniff(prn=self._ap_sniff_cb, iface=self.interface, timeout=self._scan_dwell,
+                          stop_filter=lambda p: Interceptor._ABORT is True, store=False)
         finally:
             printf("")
 
+        ap_count = sum(len(band_aps) for band_aps in self._all_ssids.values())
+        print_info(
+            f"Scan complete: {ap_count} APs, {self._scan_stats['frames_seen']} frames, "
+            f"{self._scan_stats['parse_errors']} parse errors, "
+            f"{self._scan_stats['channel_failures']} channel failures"
+        )
+        for channel in sorted(self._scan_channel_bssids):
+            self.log_debug(
+                f"Channel {channel}: {len(self._scan_channel_bssids[channel])} unique BSSIDs"
+            )
+
     def _found_custom_ssid_name(self):
         for all_channel_aps in self._all_ssids.values():
-            for ssid_name in all_channel_aps.keys():
-                if ssid_name == self._custom_ssid_name:
+            for ssid_obj in all_channel_aps.values():
+                if ssid_obj.name == self._custom_ssid_name:
                     return True
         return False
 
@@ -251,8 +386,8 @@ class Interceptor:
     def _start_initial_ap_scan(self) -> SSID:
         self._scan_channels_for_aps()
         for band_ssids in self._all_ssids.values():
-            for ssid_name, ssid_obj in band_ssids.items():
-                self._channel_range[ssid_obj.channel][ssid_name] = copy.deepcopy(ssid_obj)
+            for bssid, ssid_obj in band_ssids.items():
+                self._channel_range[ssid_obj.channel][bssid] = copy.deepcopy(ssid_obj)
 
         pref = '[   ] '
         printf(f"{DELIM}\n"
@@ -261,7 +396,7 @@ class Interceptor:
         ctr = 0
         target_map: Dict[int, SSID] = dict()
         for channel, all_channel_aps in sorted(self._channel_range.items()):
-            for ssid_name, ssid_obj in all_channel_aps.items():
+            for _bssid, ssid_obj in all_channel_aps.items():
                 ctr += 1
                 target_map[ctr] = copy.deepcopy(ssid_obj)
                 pref = f"[{str(ctr).rjust(3, ' ')}] "
@@ -272,6 +407,9 @@ class Interceptor:
             Interceptor.abort_run("Not APs were found, quitting...")
 
         printf(DELIM)
+
+        if self._scan_only:
+            return None
 
         chosen = -1
         if self._autostart:
@@ -330,7 +468,8 @@ class Interceptor:
 
     def _listen_for_clients(self):
         print_info(f"Setting up a listener for new clients...")
-        sniff(prn=self._clients_sniff_cb, iface=self.interface, stop_filter=lambda p: Interceptor._ABORT is True)
+        sniff(prn=self._clients_sniff_cb, iface=self.interface,
+              stop_filter=lambda p: Interceptor._ABORT is True, store=False)
 
     def _get_target_clients(self) -> List[str]:
         return self._custom_target_client_mac or self.target_ssid.clients
@@ -377,10 +516,14 @@ class Interceptor:
 
     def run(self):
         self.target_ssid = self._start_initial_ap_scan()
+        if self._scan_only:
+            print_info("Scan-only mode complete; no target was selected")
+            return
         ssid_ch = self.target_ssid.channel
         print_info(f"Attacking target {self.target_ssid.name}")
         print_info(f"Setting channel -> {ssid_ch}")
-        self._set_channel(ssid_ch)
+        if not self._set_channel(ssid_ch):
+            raise Exception(f"Unable to set target channel {ssid_ch}")
 
         printf(f"{DELIM}\n")
 
@@ -480,7 +623,18 @@ def main():
                         action='store_true', default=False, dest="debug_mode", required=False)
     parser.add_argument('--deauth-all-channels', help='enable de-auther on all channels',
                         action='store_true', default=False, dest="deauth_all_channels", required=False)
+    parser.add_argument('--scan-only', help='scan and list access points without selecting a target',
+                        action='store_true', default=False, dest="scan_only", required=False)
+    parser.add_argument('--scan-dwell', help='seconds to listen on each channel per scan pass (default: 2.0)',
+                        type=float, default=Interceptor._CH_SNIFF_TO, dest="scan_dwell", required=False)
+    parser.add_argument('--scan-passes', help='number of complete channel scan passes (default: 1)',
+                        type=int, default=1, dest="scan_passes", required=False)
     pargs = parser.parse_args()
+
+    if pargs.scan_dwell <= 0:
+        parser.error('--scan-dwell must be greater than 0')
+    if pargs.scan_passes <= 0:
+        parser.error('--scan-passes must be greater than 0')
 
     invalidate_print()  # after arg parsing
     attacker = Interceptor(net_iface=pargs.net_iface,
@@ -492,7 +646,10 @@ def main():
                            custom_channels=pargs.custom_channels,
                            deauth_all_channels=pargs.deauth_all_channels,
                            autostart=pargs.autostart,
-                           debug_mode=pargs.debug_mode)
+                           debug_mode=pargs.debug_mode,
+                           scan_only=pargs.scan_only,
+                           scan_dwell=pargs.scan_dwell,
+                           scan_passes=pargs.scan_passes)
     attacker.run()
 
 

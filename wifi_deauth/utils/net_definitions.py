@@ -35,5 +35,10 @@ class SSID:
 
 
 def frequency_to_channel(freq: int) -> int:
-    base = 5000 if freq // 1000 == 5 else 2407
-    return (freq - base) // 5
+    if freq == 2484:
+        return 14
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
+    if 5000 <= freq <= 5900:
+        return (freq - 5000) // 5
+    raise ValueError(f"Unsupported WiFi frequency -> {freq}")

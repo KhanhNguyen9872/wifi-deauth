@@ -62,6 +62,49 @@ sudo python3 wifi_deauth.py -i <iface>
 * `--deauth-all-channels` - try this option if the attack doesn't work (see more in [Optional Arguments](https://github.com/flashnuke/wifi-deauth/tree/main?tab=readme-ov-file#optional-arguments))
 * `--autostart` is good for automation - first make sure that only 1 access point is found, you can use filters (bssid, ssid, channels, etc...) to ensure that
 * The initial iteration over all channels might take a minute or two (depends on how many bands the interface supports)
+* Before scanning, choose `All`, `2.4 GHz only`, or `5 GHz only` at the network-band prompt. The selected band also limits `--channels` and `--deauth-all-channels`.
+* Use `--scan-only` to inventory visible BSSIDs without selecting a target. For more complete passive discovery, increase `--scan-passes`; for faster discovery, lower `--scan-dwell` carefully.
+* One adapter can listen on only one channel at a time. Truly simultaneous passive 2.4/5 GHz monitoring requires two monitor-mode adapters, one per band.
+
+### Network-band selection
+
+Every run now asks which supported band should be scanned:
+
+```text
+Choose network band: [1] All  [2] 2.4 GHz only  [3] 5 GHz only:
+```
+
+| Choice | Scan range |
+|---|---|
+| `1` | All supported 2.4 GHz and 5 GHz channels |
+| `2` | 2.4 GHz channels only |
+| `3` | 5 GHz channels only |
+
+Disabled channels and unsupported frequencies are excluded. The scanner uses `iw phy <phy> info` when available and falls back to `iwlist <iface> channel` for older systems.
+
+### Passive scan-only mode
+
+Use `--scan-only` to discover and display access points without selecting a target:
+
+```bash
+sudo wifi-deauth -i wlan0 --scan-only
+```
+
+For a faster first pass over a busy environment:
+
+```bash
+sudo wifi-deauth -i wlan0 --scan-only --scan-dwell 0.75 --scan-passes 2
+```
+
+For a slower, more complete passive scan:
+
+```bash
+sudo wifi-deauth -i wlan0 --scan-only --scan-dwell 2.5 --scan-passes 3
+```
+
+The scan summary reports discovered APs, observed frames, packet parse errors, and rejected channel changes. Enable `--debug` to also show the number of unique BSSIDs found on each channel.
+
+Access points are tracked by BSSID rather than SSID text. This means multiple radios, repeaters, or mesh nodes that advertise the same SSID remain separate results. Current band selection intentionally supports 2.4 GHz and 5 GHz; 6 GHz frequencies are ignored.
 
 ### Optional arguments
 * `--deauth-all-channels` - send de-auth packets on all allowed channels (or all custom channels if `--channels` is set) iteratively, effective against access points that switch to a different channel as a protection mechanism
@@ -73,16 +116,27 @@ sudo python3 wifi_deauth.py -i <iface>
 * `--debug` - enable debug prints
 * `--kill` (or run `sudo systemctl stop NetworkManager`) - kill NetworkManager service which might interfere with the attack
 * `--skip-monitormode` - enable monitor mode manually (otherwise the program does it automatically)
+* `--scan-only` - list discovered access points and exit without selecting a target
+* `--scan-dwell <seconds>` - listen duration per channel and pass (default: `2.0`)
+* `--scan-passes <count>` - number of complete passes over the selected channels (default: `1`)
 
 ### Misc notes
 * Setting custom client mac addresses (`--clients`) is not suggested, as some clients might reconnect using a random MAC address which is different than the one set
 * Check `ifconfig` to find the interface nickname
-* Works for 2.4GHhz and 5Ghz
+* Works with 2.4 GHz and 5 GHz channels
 
 ### Requirements
 * Linux OS
 * A network adapter that supports monitor mode and packet injection
 * Scapy library (listed in `requirements.txt`)
+
+### Tests
+
+The hardware-independent scan behavior tests can be run with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 # Deadnet & other projects
 Feel free to check out my other projects, the most recent one being [mod-rootkit](https://github.com/flashnuke/mod-rootkit), which is a Linux kernel-level rootkit designed to hide files, processes, and network activity.
